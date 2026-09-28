@@ -624,13 +624,25 @@ impl<S: SolverId> ConflictGraph<S> {
 
             // Candidates that require different version sets stay separate so each
             // distinct requirement is reported to the user (conda/rattler#2476).
+            // `ForbidMultipleInstances` edges chain every candidate of the same
+            // package name together, which makes each candidate's neighbourhood
+            // unique and prevents any merging at all. They carry no information
+            // that distinguishes one candidate from another, so ignore them.
+            let is_forbid_multiple = |w: &ConflictEdge<S>| {
+                matches!(
+                    w,
+                    ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances)
+                )
+            };
             let predecessors: Vec<_> = graph
                 .edges_directed(node_id, Direction::Incoming)
+                .filter(|e| !is_forbid_multiple(e.weight()))
                 .map(|e| (e.weight().try_requires(), e.source()))
                 .sorted_unstable()
                 .collect();
             let successors: Vec<_> = graph
                 .edges(node_id)
+                .filter(|e| !is_forbid_multiple(e.weight()))
                 .map(|e| (e.weight().try_requires(), e.target()))
                 .sorted_unstable()
                 .collect();
@@ -837,6 +849,108 @@ impl Indenter {
     }
 }
 
+/// The number of parents a candidate's subtree is repeated under.
+///
+/// Repeating it lets every branch of the report be read on its own, but a
+/// candidate that a great many parents require would otherwise bury the report
+/// in copies of the same lines; past this many, the remaining parents point at
+/// the copies already printed.
+const MAX_REPEATED_SUBTREES: usize = 4;
+
+/// The candidates the report descended through to reach a line, and the
+/// requirement it followed out of each of them.
+///
+/// It says which requirements have to hold at the same time as the line, and it
+/// identifies the line itself: the same requirement is printed once per branch
+/// that leads to it, and those are different lines.
+type LinePath = Vec<(NodeIndex, Requirement)>;
+
+/// The labels a report puts in front of the requirement lines its conflict
+/// messages point at, so that the reader can find them: `(A) nodejs 22.*` is
+/// pointed at by `..., which conflicts with nodejs 22.* (A)`.
+///
+/// A message can point at a line that is only printed further down, so the
+/// report is written twice: the first pass collects which lines are pointed at
+/// and the order they appear in, and the second one prints with the labels.
+#[derive(Default)]
+struct Anchors {
+    /// Set once the labels have been handed out and the report is being printed.
+    printing: bool,
+    /// The requirement lines and what they say, in the order they are printed.
+    order: Vec<(LinePath, String)>,
+    /// The lines a conflict message points at.
+    referenced: HashSet<LinePath>,
+    labels: HashMap<LinePath, String>,
+}
+
+impl Anchors {
+    /// Notes a requirement line, in the order the report prints it.
+    fn note_line(&mut self, line: &LinePath, requirement: &str) {
+        if !self.printing {
+            self.order.push((line.clone(), requirement.to_string()));
+        }
+    }
+
+    /// Notes that a conflict message points at a requirement line.
+    fn note_reference(&mut self, line: &LinePath) {
+        if !self.printing {
+            self.referenced.insert(line.clone());
+        }
+    }
+
+    /// Hands a label to every line that is pointed at and cannot be found by its
+    /// requirement alone, in the order the lines appear, and switches to
+    /// printing.
+    fn assign_labels(&mut self) {
+        // A requirement the report only prints once is its own anchor: the reader
+        // is told what to look for and there is only one place to find it.
+        let mut printed_lines: HashMap<&str, usize> = HashMap::default();
+        for (_, requirement) in &self.order {
+            *printed_lines.entry(requirement).or_default() += 1;
+        }
+
+        self.labels = self
+            .order
+            .iter()
+            .filter(|(line, requirement)| {
+                self.referenced.contains(line) && printed_lines[requirement.as_str()] > 1
+            })
+            .enumerate()
+            .map(|(index, (line, _))| (line.clone(), label_for(index)))
+            .collect();
+        self.printing = true;
+    }
+
+    /// `(A) `, to put in front of a requirement line that is pointed at.
+    fn prefix(&self, line: &LinePath) -> String {
+        match self.labels.get(line) {
+            Some(label) => format!("({label}) "),
+            None => String::new(),
+        }
+    }
+
+    /// ` (A)`, to put after a mention of a requirement line.
+    fn suffix(&self, line: Option<&LinePath>) -> String {
+        match line.and_then(|line| self.labels.get(line)) {
+            Some(label) => format!(" ({label})"),
+            None => String::new(),
+        }
+    }
+}
+
+/// The `index`th label: `A`, `B`, .., `Z`, `AA`, `AB`, ..
+fn label_for(index: usize) -> String {
+    let mut label = String::new();
+    let mut index = index;
+    loop {
+        label.insert(0, char::from(b'A' + (index % 26) as u8));
+        if index < 26 {
+            return label;
+        }
+        index = index / 26 - 1;
+    }
+}
+
 /// A struct implementing [`fmt::Display`] that generates a user-friendly
 /// representation of a conflict graph
 pub struct DisplayUnsat<'i, I: Interner> {
@@ -862,6 +976,43 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
         }
     }
 
+    /// Whether a candidate is unusable because a different version of the same
+    /// package is required elsewhere.
+    ///
+    /// The [`ConflictCause::ForbidMultipleInstances`] clauses form a chain over
+    /// all candidates of a package, so a candidate takes part in such a conflict
+    /// whether the edge points at it or away from it; only looking at outgoing
+    /// edges misses the last link of the chain. Installable candidates sit in
+    /// that chain too, but they are presented as viable options and must not be
+    /// blamed for it.
+    fn conflicts_with_other_versions(&self, candidate: NodeIndex) -> bool {
+        let graph = &self.graph.graph;
+        !self.installable_set.contains(&candidate)
+            && graph
+                .edges_directed(candidate, Direction::Outgoing)
+                .chain(graph.edges_directed(candidate, Direction::Incoming))
+                .any(|e| {
+                    e.weight() == &ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances)
+                })
+    }
+
+    /// The solvables a candidate has been merged with, or just the candidate
+    /// itself if it stands alone.
+    fn group_of<'a>(&'a self, solvable_id: &'a I::SolvableId) -> &'a [I::SolvableId] {
+        self.merged_candidates
+            .get(solvable_id)
+            .map_or(std::slice::from_ref(solvable_id), |merged| {
+                merged.ids.as_slice()
+            })
+    }
+
+    /// Describes a candidate, naming every version it has been merged with.
+    fn display_candidate(&self, solvable_id: I::SolvableId) -> String {
+        self.interner
+            .display_merged_solvables(self.group_of(&solvable_id))
+            .to_string()
+    }
+
     /// Returns the reason a solvable was excluded, if it was.
     fn excluded_reason(&self, solvable_id: I::SolvableId) -> Option<StringId> {
         let graph = &self.graph.graph;
@@ -877,11 +1028,146 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
         })
     }
 
+    /// The other candidates of the same package that this report also asks for,
+    /// one solvable per merge group.
+    ///
+    /// Only one version of a package can be installed at a time, so a candidate
+    /// that takes part in a [`ConflictCause::ForbidMultipleInstances`] conflict
+    /// is unusable because some other version of it is required elsewhere.
+    /// Naming those versions tells the user which requirements cannot be
+    /// satisfied together, instead of leaving them to guess.
+    fn conflicting_candidates(&self, candidate: NodeIndex) -> Vec<I::SolvableId> {
+        let graph = &self.graph.graph;
+        let Some(solvable_id) = graph[candidate].solvable() else {
+            return Vec::new();
+        };
+        let name = self.interner.solvable_name(solvable_id);
+
+        // The candidate's own merge group is not a rival: only one of its members
+        // has to be installable for the group to be usable.
+        let mut seen: HashSet<I::SolvableId> =
+            self.group_of(&solvable_id).iter().copied().collect();
+        let mut rivals = Vec::new();
+        for rival in graph
+            .node_indices()
+            .filter_map(|node| graph[node].solvable())
+            .filter(|&id| self.interner.solvable_name(id) == name)
+        {
+            // Report every merge group once, no matter which of its members is
+            // encountered first.
+            if seen.contains(&rival) {
+                continue;
+            }
+            seen.extend(self.group_of(&rival).iter().copied());
+            rivals.push(rival);
+        }
+
+        // The graph's node order is an implementation detail; sort so the message
+        // is stable and the versions read in a predictable order.
+        rivals.sort_unstable_by_key(|&id| self.display_candidate(id));
+        rivals
+    }
+
+    /// The requirements that ask for another version of the candidate's package,
+    /// given the path the report took to reach it.
+    ///
+    /// Every candidate of a package rules out all the others, but most of those
+    /// are asked for somewhere else entirely, or by an alternative that does not
+    /// have to be picked. The ones that make *this* candidate unusable are the
+    /// ones the other requirements of the candidates on the path lead to: those
+    /// have to hold at the same time as the requirement that led here.
+    ///
+    /// The requirement is named rather than the versions it resolves to, because
+    /// it says in the user's own terms what cannot be met at the same time, and
+    /// it is spelled out somewhere else in the report anyway. Each one comes with
+    /// the line that spells it out, so that the message can point at it.
+    fn conflicting_requirements_on_path(
+        &self,
+        candidate: NodeIndex,
+        path: &[(NodeIndex, Requirement)],
+    ) -> Vec<(String, LinePath)> {
+        let graph = &self.graph.graph;
+        let Some(solvable_id) = graph[candidate].solvable() else {
+            return Vec::new();
+        };
+        let name = self.interner.solvable_name(solvable_id);
+
+        // The candidate's own merge group is not a rival: only one of its members
+        // has to be installable for the group to be usable.
+        let mut seen: HashSet<I::SolvableId> =
+            self.group_of(&solvable_id).iter().copied().collect();
+        let mut rivals = Vec::new();
+        for (index, &(ancestor, taken)) in path.iter().enumerate() {
+            // Walk everything the sibling requirements of this ancestor lead to.
+            // Alternatives of the requirement that led here are not rivals: only
+            // one of them has to be installable.
+            let mut queue: Vec<(NodeIndex, LinePath)> = graph
+                .edges(ancestor)
+                .filter_map(|e| {
+                    let requirement = e.weight().try_requires()?;
+                    if requirement == taken {
+                        return None;
+                    }
+                    // The sibling is printed where this ancestor is, so its line
+                    // is the path that led here with the sibling followed instead.
+                    let mut line = path[..index].to_vec();
+                    line.push((ancestor, requirement));
+                    Some((e.target(), line))
+                })
+                .collect();
+            let mut visited: HashSet<NodeIndex> = queue.iter().map(|(node, _)| *node).collect();
+            while let Some((node, line)) = queue.pop() {
+                if let Some(id) = graph[node].solvable() {
+                    if self.interner.solvable_name(id) == name && !seen.contains(&id) {
+                        seen.extend(self.group_of(&id).iter().copied());
+                        let (_, requirement) = *line.last().expect("a line names a requirement");
+                        rivals.push((requirement.display(self.interner).to_string(), line.clone()));
+                    }
+                }
+                for edge in graph.edges(node) {
+                    let Some(requirement) = edge.weight().try_requires() else {
+                        continue;
+                    };
+                    if visited.insert(edge.target()) {
+                        let mut line = line.clone();
+                        line.push((node, requirement));
+                        queue.push((edge.target(), line));
+                    }
+                }
+            }
+        }
+
+        // The graph's edge order is an implementation detail; sort so the message
+        // is stable, and name a requirement that several candidates match once.
+        rivals.sort_unstable();
+        rivals.dedup_by(|(a, _), (b, _)| a == b);
+        rivals
+    }
+
+    /// Writes the report, once to work out the labels and once for real.
     fn fmt_graph(
         &self,
         f: &mut Formatter<'_>,
         top_level_edges: &[EdgeReference<'_, ConflictEdge<I::SolvableId>>],
         top_level_indent: bool,
+    ) -> fmt::Result {
+        let mut anchors = Anchors::default();
+        self.write_graph(
+            &mut String::new(),
+            top_level_edges,
+            top_level_indent,
+            &mut anchors,
+        )?;
+        anchors.assign_labels();
+        self.write_graph(f, top_level_edges, top_level_indent, &mut anchors)
+    }
+
+    fn write_graph(
+        &self,
+        w: &mut dyn fmt::Write,
+        top_level_edges: &[EdgeReference<'_, ConflictEdge<I::SolvableId>>],
+        top_level_indent: bool,
+        anchors: &mut Anchors,
     ) -> fmt::Result {
         pub enum DisplayOp {
             Requirement(Requirement, Vec<EdgeIndex>),
@@ -890,7 +1176,14 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
 
         let graph = &self.graph.graph;
         let installable_nodes = &self.installable_set;
-        let mut reported = HashSet::new();
+
+        // How often the subtree below a candidate has been spelled out already.
+        let mut expanded: HashMap<SolvableIdOrRoot<I::SolvableId>, usize> = HashMap::default();
+
+        // The candidates the printer descended through to reach a stack entry, and
+        // the requirement it followed out of each of them. Used to tell which
+        // requirements have to hold at the same time.
+        type Path = Rc<Vec<(NodeIndex, Requirement)>>;
 
         // Note: we are only interested in requires edges here
         let indenter = Indenter::new(top_level_indent);
@@ -912,6 +1205,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                 (
                     DisplayOp::Requirement(version_set_id, edges),
                     indenter.push_level(),
+                    Rc::new(vec![(self.graph.root_node, version_set_id)]) as Path,
                 )
             })
             .collect::<Vec<_>>();
@@ -921,7 +1215,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
             stack[0].1.set_last();
         }
 
-        while let Some((node, indenter)) = stack.pop() {
+        while let Some((node, indenter, path)) = stack.pop() {
             let top_level = indenter.is_at_top_level();
             let indent = indenter.get_indent();
 
@@ -936,27 +1230,35 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
 
                     let req = requirement.display(self.interner).to_string();
 
+                    // This line is what a conflict message elsewhere in the report
+                    // points at, if it needs a version this requirement rules out.
+                    let anchor = anchors.prefix(&path);
+                    anchors.note_line(&path, &req);
+
                     let target_nx = graph.edge_endpoints(edges[0]).unwrap().1;
                     let missing =
                         edges.len() == 1 && graph[target_nx] == ConflictNode::UnresolvedDependency;
                     if missing {
                         // No candidates for requirement
                         if top_level {
-                            writeln!(f, "{indent}No candidates were found for {req}.")?;
+                            writeln!(w, "{indent}No candidates were found for {anchor}{req}.")?;
                         } else {
-                            writeln!(f, "{indent}{req}, for which no candidates were found.",)?;
+                            writeln!(
+                                w,
+                                "{indent}{anchor}{req}, for which no candidates were found.",
+                            )?;
                         }
                     } else if installable {
                         // Package can be installed (only mentioned for top-level requirements)
                         if top_level {
                             writeln!(
-                                f,
-                                "{indent}{req} can be installed with any of the following options:"
+                                w,
+                                "{indent}{anchor}{req} can be installed with any of the following options:"
                             )?;
                         } else {
                             writeln!(
-                                f,
-                                "{indent}{req}, which can be installed with any of the following options:"
+                                w,
+                                "{indent}{anchor}{req}, which can be installed with any of the following options:"
                             )?;
                         }
 
@@ -969,6 +1271,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                                 (
                                     DisplayOp::Candidate(graph.edge_endpoints(e).unwrap().1),
                                     indenter.push_level(),
+                                    path.clone(),
                                 )
                             })
                             .collect();
@@ -977,7 +1280,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                         let mut deduplicated_children = Vec::new();
                         let mut merged_and_seen = HashSet::new();
                         for child in children {
-                            let (DisplayOp::Candidate(child_node), _) = child else {
+                            let (DisplayOp::Candidate(child_node), _, _) = child else {
                                 unreachable!()
                             };
                             let solvable_id = graph[child_node].solvable_or_root();
@@ -1009,13 +1312,13 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                         // the tree)
                         if top_level {
                             writeln!(
-                                f,
-                                "{indent}{req} cannot be installed because there are no viable options:"
+                                w,
+                                "{indent}{anchor}{req} cannot be installed because there are no viable options:"
                             )?;
                         } else {
                             writeln!(
-                                f,
-                                "{indent}{req}, which cannot be installed because there are no viable options:"
+                                w,
+                                "{indent}{anchor}{req}, which cannot be installed because there are no viable options:"
                             )?;
                         }
 
@@ -1025,6 +1328,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                                 (
                                     DisplayOp::Candidate(graph.edge_endpoints(e).unwrap().1),
                                     indenter.push_level(),
+                                    path.clone(),
                                 )
                             })
                             .collect();
@@ -1033,7 +1337,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                         let mut deduplicated_children = Vec::new();
                         let mut merged_and_seen = HashSet::new();
                         for child in children {
-                            let (DisplayOp::Candidate(child_node), _) = child else {
+                            let (DisplayOp::Candidate(child_node), _, _) = child else {
                                 unreachable!()
                             };
                             let Some(solvable_id) = graph[child_node].solvable() else {
@@ -1063,25 +1367,36 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                 DisplayOp::Candidate(candidate) => {
                     let solvable_id = graph[candidate].solvable_or_root();
 
-                    if reported.contains(&solvable_id) {
+                    let version = match solvable_id.solvable() {
+                        Some(id) => self.display_candidate(id),
+                        None => "<root>".to_string(),
+                    };
+
+                    // A candidate reachable through several parents is printed
+                    // below each of them, so that every branch can be read on its
+                    // own. Two things have to cut that off: a circular dependency,
+                    // whose subtree would never end, and a candidate pulled in by
+                    // very many parents, which would bury the report in copies.
+                    let repeats_ancestor = path.iter().any(|&(ancestor, _)| {
+                        match (graph[ancestor].solvable(), solvable_id.solvable()) {
+                            (Some(ancestor), Some(id)) => self.group_of(&id).contains(&ancestor),
+                            _ => false,
+                        }
+                    });
+                    // A candidate without requirements of its own is a single line;
+                    // pointing at an earlier copy of it saves nothing.
+                    let repeated_too_often = graph
+                        .edges(candidate)
+                        .any(|e| e.weight().try_requires().is_some())
+                        && {
+                            let printed = expanded.entry(solvable_id).or_insert(0);
+                            *printed += 1;
+                            *printed > MAX_REPEATED_SUBTREES
+                        };
+                    if repeats_ancestor || repeated_too_often {
+                        writeln!(w, "{indent}{version}, as reported above")?;
                         continue;
                     }
-
-                    let version = if let Some(merged) = solvable_id
-                        .solvable()
-                        .and_then(|solvable_id| self.merged_candidates.get(&solvable_id))
-                    {
-                        reported.extend(merged.ids.iter().copied().map(SolvableIdOrRoot::from));
-                        self.interner
-                            .display_merged_solvables(&merged.ids)
-                            .to_string()
-                    } else if let Some(solvable_id) = solvable_id.solvable() {
-                        self.interner
-                            .display_merged_solvables(&[solvable_id])
-                            .to_string()
-                    } else {
-                        "<root>".to_string()
-                    };
 
                     let excluded = graph
                         .edges_directed(candidate, Direction::Outgoing)
@@ -1094,10 +1409,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                             }
                             _ => None,
                         });
-                    let already_installed = graph.edges(candidate).any(|e| {
-                        e.weight()
-                            == &ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances)
-                    });
+                    let already_installed = self.conflicts_with_other_versions(candidate);
                     let constrains_conflict = graph.edges(candidate).any(|e| {
                         matches!(
                             e.weight(),
@@ -1108,17 +1420,57 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
 
                     if let Some(excluded_reason) = excluded {
                         writeln!(
-                            f,
+                            w,
                             "{indent}{version} is excluded because {reason}",
                             reason = self.interner.display_string(excluded_reason),
                         )?;
-                    } else if is_leaf {
-                        writeln!(f, "{indent}{version}")?;
                     } else if already_installed {
-                        writeln!(
-                            f,
-                            "{indent}{version}, which conflicts with the versions reported above."
-                        )?;
+                        // Spell out *what* these candidates are unusable with: a
+                        // package can only be present once, so name the other
+                        // requirements for it that have to hold at the same time.
+                        let mut rivals: Vec<(String, Option<LinePath>)> = self
+                            .conflicting_requirements_on_path(candidate, &path)
+                            .into_iter()
+                            .map(|(req, line)| (req, Some(line)))
+                            .collect();
+                        if rivals.is_empty() {
+                            // The conflict is with a version required outside of
+                            // the path that led here, so fall back to naming every
+                            // other version in the report.
+                            rivals = self
+                                .conflicting_candidates(candidate)
+                                .into_iter()
+                                .map(|id| (self.display_candidate(id), None))
+                                .collect();
+                        }
+
+                        // Point at the lines the requirements are spelled out on,
+                        // so that the reader can find them.
+                        let rivals = rivals
+                            .into_iter()
+                            .map(|(req, line)| {
+                                if let Some(line) = &line {
+                                    anchors.note_reference(line);
+                                }
+                                format!("{req}{label}", label = anchors.suffix(line.as_ref()))
+                            })
+                            .collect_vec();
+                        match rivals.as_slice() {
+                            [] => writeln!(
+                                w,
+                                "{indent}{version}, which conflicts with the versions reported above."
+                            )?,
+                            [rival] => {
+                                writeln!(w, "{indent}{version}, which conflicts with {rival}")?
+                            }
+                            [rivals @ .., last] => writeln!(
+                                w,
+                                "{indent}{version}, which conflicts with {rivals} and {last}",
+                                rivals = rivals.iter().format(", "),
+                            )?,
+                        }
+                    } else if is_leaf {
+                        writeln!(w, "{indent}{version}")?;
                     } else if constrains_conflict {
                         let mut version_sets = graph
                             .edges(candidate)
@@ -1131,7 +1483,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                             .dedup()
                             .peekable();
 
-                        writeln!(f, "{indent}{version} would constrain",)?;
+                        writeln!(w, "{indent}{version} would constrain",)?;
 
                         let mut indenter = indenter.push_level();
                         while let Some(&version_set_id) = version_sets.next() {
@@ -1145,12 +1497,12 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                             }
                             let indent = indenter.get_indent();
                             writeln!(
-                                f,
+                                w,
                                 "{indent}{name} {version_set}, which conflicts with any installable versions previously reported",
                             )?;
                         }
                     } else {
-                        writeln!(f, "{indent}{version} would require",)?;
+                        writeln!(w, "{indent}{version} would require",)?;
                         let mut requirements = graph
                             .edges(candidate)
                             .chunk_by(|e| e.weight().requires())
@@ -1166,9 +1518,12 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                                 })
                             })
                             .map(|(version_set_id, edges)| {
+                                let mut descended = (*path).clone();
+                                descended.push((candidate, version_set_id));
                                 (
                                     DisplayOp::Requirement(version_set_id, edges),
                                     indenter.push_level(),
+                                    Rc::new(descended) as Path,
                                 )
                             })
                             .collect::<Vec<_>>();
@@ -1270,6 +1625,18 @@ impl<I: Interner> fmt::Display for DisplayUnsat<'_, I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_labels_continue_past_the_alphabet() {
+        assert_eq!(label_for(0), "A");
+        assert_eq!(label_for(25), "Z");
+        assert_eq!(label_for(26), "AA");
+        assert_eq!(label_for(27), "AB");
+        assert_eq!(label_for(51), "AZ");
+        assert_eq!(label_for(52), "BA");
+        assert_eq!(label_for(701), "ZZ");
+        assert_eq!(label_for(702), "AAA");
+    }
 
     #[test]
     fn test_indenter_without_top_level_indent() {
