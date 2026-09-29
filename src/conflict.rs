@@ -867,7 +867,7 @@ type LinePath = Vec<(NodeIndex, Requirement)>;
 
 /// The labels a report puts in front of the requirement lines its conflict
 /// messages point at, so that the reader can find them: `(A) nodejs 22.*` is
-/// pointed at by `..., which conflicts with nodejs 22.* (A)`.
+/// pointed at by `..., which conflicts with 20.* (B) and 22.* (A)`.
 ///
 /// A message can point at a line that is only printed further down, so the
 /// report is written twice: the first pass collects which lines are pointed at
@@ -876,18 +876,19 @@ type LinePath = Vec<(NodeIndex, Requirement)>;
 struct Anchors {
     /// Set once the labels have been handed out and the report is being printed.
     printing: bool,
-    /// The requirement lines and what they say, in the order they are printed.
-    order: Vec<(LinePath, String)>,
+    /// The requirement lines, in the order they are printed.
+    order: Vec<LinePath>,
     /// The lines a conflict message points at.
     referenced: HashSet<LinePath>,
-    labels: HashMap<LinePath, String>,
+    /// The position in the label sequence a line was handed, if it was.
+    labels: HashMap<LinePath, usize>,
 }
 
 impl Anchors {
     /// Notes a requirement line, in the order the report prints it.
-    fn note_line(&mut self, line: &LinePath, requirement: &str) {
+    fn note_line(&mut self, line: &LinePath) {
         if !self.printing {
-            self.order.push((line.clone(), requirement.to_string()));
+            self.order.push(line.clone());
         }
     }
 
@@ -898,33 +899,29 @@ impl Anchors {
         }
     }
 
-    /// Hands a label to every line that is pointed at and cannot be found by its
-    /// requirement alone, in the order the lines appear, and switches to
-    /// printing.
+    /// Hands a label to every line that is pointed at, in the order the lines
+    /// appear, and switches to printing.
     fn assign_labels(&mut self) {
-        // A requirement the report only prints once is its own anchor: the reader
-        // is told what to look for and there is only one place to find it.
-        let mut printed_lines: HashMap<&str, usize> = HashMap::default();
-        for (_, requirement) in &self.order {
-            *printed_lines.entry(requirement).or_default() += 1;
-        }
-
         self.labels = self
             .order
             .iter()
-            .filter(|(line, requirement)| {
-                self.referenced.contains(line) && printed_lines[requirement.as_str()] > 1
-            })
+            .filter(|line| self.referenced.contains(*line))
             .enumerate()
-            .map(|(index, (line, _))| (line.clone(), label_for(index)))
+            .map(|(index, line)| (line.clone(), index))
             .collect();
         self.printing = true;
+    }
+
+    /// Where a line sits in the label sequence, for listing mentions of several
+    /// lines in the order the report prints them.
+    fn label_index(&self, line: &LinePath) -> Option<usize> {
+        self.labels.get(line).copied()
     }
 
     /// `(A) `, to put in front of a requirement line that is pointed at.
     fn prefix(&self, line: &LinePath) -> String {
         match self.labels.get(line) {
-            Some(label) => format!("({label}) "),
+            Some(&index) => format!("({label}) ", label = label_for(index)),
             None => String::new(),
         }
     }
@@ -932,7 +929,7 @@ impl Anchors {
     /// ` (A)`, to put after a mention of a requirement line.
     fn suffix(&self, line: Option<&LinePath>) -> String {
         match line.and_then(|line| self.labels.get(line)) {
-            Some(label) => format!(" ({label})"),
+            Some(&index) => format!(" ({label})", label = label_for(index)),
             None => String::new(),
         }
     }
@@ -956,6 +953,7 @@ fn label_for(index: usize) -> String {
 pub struct DisplayUnsat<'i, I: Interner> {
     graph: ConflictGraph<I::SolvableId>,
     merged_candidates: HashMap<I::SolvableId, Rc<MergedConflictNode<I::SolvableId>>>,
+    nodes_by_solvable: HashMap<I::SolvableId, NodeIndex>,
     installable_set: HashSet<NodeIndex>,
     missing_set: HashSet<NodeIndex>,
     interner: &'i I,
@@ -964,12 +962,18 @@ pub struct DisplayUnsat<'i, I: Interner> {
 impl<'i, I: Interner> DisplayUnsat<'i, I> {
     pub(crate) fn new(graph: ConflictGraph<I::SolvableId>, interner: &'i I) -> Self {
         let merged_candidates = graph.simplify(interner);
+        let nodes_by_solvable = graph
+            .graph
+            .node_indices()
+            .filter_map(|node| graph.graph[node].solvable().map(|id| (id, node)))
+            .collect();
         let installable_set = graph.get_installable_set();
         let missing_set = graph.get_missing_set();
 
         Self {
             graph,
             merged_candidates,
+            nodes_by_solvable,
             installable_set,
             missing_set,
             interner,
@@ -1004,6 +1008,27 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
             .map_or(std::slice::from_ref(solvable_id), |merged| {
                 merged.ids.as_slice()
             })
+    }
+
+    /// The node a line path keys a candidate on.
+    ///
+    /// Candidates that have been merged are printed as one line and only one of
+    /// them is descended into, but a path that leads through the group can arrive
+    /// at any of its members. They all have the same requirements, so keying every
+    /// member on the same node makes a path built while looking for conflicts
+    /// match the line the report prints.
+    fn canonical_node(&self, node: NodeIndex) -> NodeIndex {
+        self.graph.graph[node]
+            .solvable()
+            .and_then(|id| self.nodes_by_solvable.get(&self.group_of(&id)[0]).copied())
+            .unwrap_or(node)
+    }
+
+    /// The name of the package a candidate is a version of, as it is displayed.
+    fn package_name_of(&self, candidate: NodeIndex) -> Option<String> {
+        let solvable_id = self.graph.graph[candidate].solvable()?;
+        let name = self.interner.solvable_name(solvable_id);
+        Some(self.interner.display_name(name).to_string())
     }
 
     /// Describes a candidate, naming every version it has been merged with.
@@ -1130,7 +1155,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                     };
                     if visited.insert(edge.target()) {
                         let mut line = line.clone();
-                        line.push((node, requirement));
+                        line.push((self.canonical_node(node), requirement));
                         queue.push((edge.target(), line));
                     }
                 }
@@ -1233,7 +1258,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                     // This line is what a conflict message elsewhere in the report
                     // points at, if it needs a version this requirement rules out.
                     let anchor = anchors.prefix(&path);
-                    anchors.note_line(&path, &req);
+                    anchors.note_line(&path);
 
                     let target_nx = graph.edge_endpoints(edges[0]).unwrap().1;
                     let missing =
@@ -1446,26 +1471,56 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
 
                         // Point at the lines the requirements are spelled out on,
                         // so that the reader can find them.
+                        for (_, line) in &rivals {
+                            if let Some(line) = line {
+                                anchors.note_reference(line);
+                            }
+                        }
+
+                        // List them in the order the report prints the lines they
+                        // point at, so that the labels run in one direction.
+                        // Requirements without a line to point at keep their
+                        // place at the end, sorted by what they say.
+                        rivals.sort_by_cached_key(|(req, line)| {
+                            let label = line
+                                .as_ref()
+                                .and_then(|line| anchors.label_index(line))
+                                .unwrap_or(usize::MAX);
+                            (label, req.clone())
+                        });
+
+                        // Every rival is a requirement on the same package as the
+                        // candidate, so name it once in front of the list rather
+                        // than repeating it before every entry.
+                        let lead = self
+                            .package_name_of(candidate)
+                            .map(|name| format!("{name} "))
+                            .filter(|lead| {
+                                rivals.iter().all(|(req, _)| req.starts_with(lead.as_str()))
+                            });
                         let rivals = rivals
-                            .into_iter()
+                            .iter()
                             .map(|(req, line)| {
-                                if let Some(line) = &line {
-                                    anchors.note_reference(line);
-                                }
+                                let req = match &lead {
+                                    Some(lead) => &req[lead.len()..],
+                                    None => req.as_str(),
+                                };
                                 format!("{req}{label}", label = anchors.suffix(line.as_ref()))
                             })
                             .collect_vec();
+                        let lead = lead.as_deref().unwrap_or_default();
                         match rivals.as_slice() {
                             [] => writeln!(
                                 w,
                                 "{indent}{version}, which conflicts with the versions reported above."
                             )?,
-                            [rival] => {
-                                writeln!(w, "{indent}{version}, which conflicts with {rival}")?
-                            }
+                            [rival] => writeln!(
+                                w,
+                                "{indent}{version}, which conflicts with {lead}{rival}"
+                            )?,
                             [rivals @ .., last] => writeln!(
                                 w,
-                                "{indent}{version}, which conflicts with {rivals} and {last}",
+                                "{indent}{version}, which conflicts with {lead}{rivals} and {last}",
                                 rivals = rivals.iter().format(", "),
                             )?,
                         }
@@ -1519,7 +1574,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                             })
                             .map(|(version_set_id, edges)| {
                                 let mut descended = (*path).clone();
-                                descended.push((candidate, version_set_id));
+                                descended.push((self.canonical_node(candidate), version_set_id));
                                 (
                                     DisplayOp::Requirement(version_set_id, edges),
                                     indenter.push_level(),
